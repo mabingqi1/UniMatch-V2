@@ -141,12 +141,12 @@ def main():
         best_epoch_ema = checkpoint['best_epoch_ema']
         
         if rank == 0:
-            logger.info('************ Load from checkpoint at epoch %i\n' % epoch)
+            logger.info('>>>>>> Load from checkpoint at epoch %i\n' % epoch)
     
     for epoch in range(epoch + 1, cfg['epochs']):
         if rank == 0:
-            logger.info('===========> Epoch: {:}, Previous best: {:.2f} @epoch-{:}, '
-                        'EMA: {:.2f} @epoch-{:}'.format(epoch, previous_best, best_epoch, previous_best_ema, best_epoch_ema))
+            logger.info('Train | Epoch: {:} | Previous best: {:.2f} @ epoch-{:} | '
+                        'EMA: {:.2f} @ epoch-{:}'.format(epoch, previous_best, best_epoch, previous_best_ema, best_epoch_ema))
         
         total_loss  = AverageMeter()
         total_loss_x = AverageMeter()
@@ -231,9 +231,9 @@ def main():
                 writer.add_scalar('train/loss_s', loss_u_s.item(), iters)
                 writer.add_scalar('train/mask_ratio', mask_ratio, iters)
 
-            if (i % (len(trainloader_u) // 8) == 0) and (rank == 0):
-                logger.info('Iters: {:}, LR: {:.7f}, Total loss: {:.3f}, Loss x: {:.3f}, Loss s: {:.3f}, Mask ratio: '
-                            '{:.3f}'.format(i, optimizer.param_groups[0]['lr'], total_loss.avg, total_loss_x.avg, 
+            if (i % 20 == 0) and (rank == 0):
+                logger.info('Train | EPOCH {} | Iters: {:} | LR: {:.7f} | Total loss: {:.3f} | Loss x: {:.3f} | Loss s: {:.3f}, Mask ratio: '
+                            '{:.3f}'.format(epoch, i, optimizer.param_groups[0]['lr'], total_loss.avg, total_loss_x.avg, 
                                             total_loss_s.avg, total_mask_ratio.avg))
         
         eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
@@ -242,9 +242,9 @@ def main():
         
         if rank == 0:
             for (cls_idx, iou) in enumerate(iou_class):
-                logger.info('***** Evaluation ***** >>>> Class [{:} {:}] IoU: {:.2f}, '
+                logger.info('Evaluation | Class [{:} {:}] IoU: {:.2f}, '
                             'EMA: {:.2f}'.format(cls_idx, CLASSES[cfg['dataset']][cls_idx], iou, iou_class_ema[cls_idx]))
-            logger.info('***** Evaluation {} ***** >>>> MeanIoU: {:.2f}, EMA: {:.2f}\n'.format(eval_mode, mIoU, mIoU_ema))
+            logger.info(' Evaluation {} >>>> MeanIoU: {:.2f}, EMA: {:.2f}\n'.format(eval_mode, mIoU, mIoU_ema))
             
             writer.add_scalar('eval/mIoU', mIoU, epoch)
             writer.add_scalar('eval/mIoU_ema', mIoU_ema, epoch)
