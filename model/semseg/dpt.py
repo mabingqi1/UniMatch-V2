@@ -113,6 +113,8 @@ class DPT(nn.Module):
     def __init__(
         self, 
         encoder_size='base', 
+        img_size=512,
+        patch_size=16,
         nclass=21,
         features=128, 
         out_channels=[96, 192, 384, 768], 
@@ -126,9 +128,9 @@ class DPT(nn.Module):
             'large': [4, 11, 17, 23], 
             'giant': [9, 19, 29, 39]
         }
-        
+        self.patch_size = patch_size
         self.encoder_size = encoder_size
-        self.backbone = DINOv2(model_name=encoder_size)
+        self.backbone = DINOv2(model_name=encoder_size, img_size=img_size, patch_size=patch_size)
         
         self.head = DPTHead(nclass, self.backbone.embed_dim, features, use_bn, out_channels=out_channels)
         
@@ -139,7 +141,7 @@ class DPT(nn.Module):
             p.requires_grad = False
     
     def forward(self, x, comp_drop=False):
-        patch_h, patch_w = x.shape[-2] // 14, x.shape[-1] // 14
+        patch_h, patch_w = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size
         
         features = self.backbone.get_intermediate_layers(
             x, self.intermediate_layer_idx[self.encoder_size]
@@ -162,11 +164,11 @@ class DPT(nn.Module):
             
             out = self.head(features, patch_h, patch_w)
             
-            out = F.interpolate(out, (patch_h * 14, patch_w * 14), mode='bilinear', align_corners=True)
+            out = F.interpolate(out, (patch_h * self.patch_size, patch_w * self.patch_size), mode='bilinear', align_corners=True)
             
             return out
         
         out = self.head(features, patch_h, patch_w)
-        out = F.interpolate(out, (patch_h * 14, patch_w * 14), mode='bilinear', align_corners=True)
+        out = F.interpolate(out, (patch_h * self.patch_size, patch_w * self.patch_size), mode='bilinear', align_corners=True)
         
         return out

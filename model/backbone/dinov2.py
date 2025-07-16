@@ -46,7 +46,7 @@ class DinoVisionTransformer(nn.Module):
         self,
         img_size=224,
         patch_size=16,
-        in_chans=3,
+        in_chans=1,
         embed_dim=768,
         depth=12,
         num_heads=12,
@@ -397,7 +397,7 @@ def vit_giant2(patch_size=16, num_register_tokens=0, **kwargs):
     return model
 
 
-def DINOv2(model_name):
+def DINOv2(model_name, img_size, patch_size):
     model_zoo = {
         "small": vit_small, 
         "base": vit_base, 
@@ -406,8 +406,9 @@ def DINOv2(model_name):
     }
     
     return model_zoo[model_name](
-        img_size=518,
-        patch_size=14,
+        img_size=img_size,
+        patch_size=patch_size,
+        in_chans=1,
         init_values=1.0,
         ffn_layer="mlp" if model_name != "giant" else "swiglufused",
         block_chunks=0,

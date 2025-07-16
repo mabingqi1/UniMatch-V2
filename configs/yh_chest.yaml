@@ -1,0 +1,24 @@
+unlabel_num: 7800 # 1:10
+
+nclass: 11
+crop_size: 512
+patch_size: 16
+
+# arguments for training
+epochs: 20
+batch_size: 12 # per GPU x 4 GPUs
+lr: 0.000005
+lr_multi: 40.0
+criterion:
+  name: CELoss
+  kwargs: 
+    ignore_index: 255
+conf_thresh: 0.95
+ema_ratio_min: 0.996
+eval_mode: 'original' # 'original' or 'sliding_window'
+
+# arguments for model
+model: dpt
+backbone: dinov2_base
+pretrain_weight: /yinghepool/mabingqi/tmp_models/DINOv2-2D-ViT-base_projectx-150w_ckpt70k.pt
+lock_backbone: False

@@ -1,10 +1,8 @@
-import random
-
-import numpy as np
 from PIL import Image, ImageOps, ImageFilter
-import torch
 from torchvision import transforms
-
+import random
+import numpy as np
+import torch
 
 def crop(img, mask, size, ignore_value=255):
     w, h = img.size
@@ -82,3 +80,4 @@ def obtain_cutmix_box(img_size, p=0.5, size_min=0.02, size_max=0.4, ratio_1=0.3,
     mask[y:y + cutmix_h, x:x + cutmix_w] = 1
 
     return mask
+

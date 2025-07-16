@@ -3,7 +3,7 @@ import logging
 import glob
 import os
 import pprint
-
+from tqdm import tqdm
 import torch
 import numpy as np
 from torch import nn
@@ -14,6 +14,7 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import yaml
+from monai.metrics import DiceMetric
 
 from dataset.semi import SemiDataset
 from model.semseg.dpt import DPT
@@ -36,18 +37,16 @@ parser.add_argument('--port', default=None, type=int)
 def evaluate(model, loader, mode, cfg, multiplier=None):
     model.eval()
     assert mode in ['original', 'center_crop', 'sliding_window']
-    intersection_meter = AverageMeter()
-    union_meter = AverageMeter()
+    dice_metric = DiceMetric(include_background=False, reduction="mean_batch")
 
     with torch.no_grad():
-        for img, mask, id in loader:
-            
+        for img, mask in tqdm(loader, total=len(loader)):
             img = img.cuda()
-                
+            mask = mask.cuda()
             if mode == 'sliding_window':
                 grid = cfg['crop_size']
                 b, _, h, w = img.shape
-                final = torch.zeros(b, 19, h, w).cuda()
+                final = torch.zeros(b, cfg['nclass'], h, w).cuda()
                 
                 row = 0
                 while row < h:
@@ -79,27 +78,41 @@ def evaluate(model, loader, mode, cfg, multiplier=None):
             
                 if multiplier is not None:
                     pred = F.interpolate(pred, (ori_h, ori_w), mode='bilinear', align_corners=True)
-            
+            pred = pred.softmax(dim=1)
             pred = pred.argmax(dim=1)
+            pred = F.one_hot(pred.squeeze(1), num_classes=cfg['nclass']+1).permute(0, 3, 1, 2).float()  # [B, n_cls, H, W]
+            mask = F.one_hot(mask.squeeze(1), num_classes=cfg['nclass']+1).permute(0, 3, 1, 2).float()
+            
+            dice = dice_metric(y_pred=pred, y=mask)
+            dice = dice.mean(dim=0)
+            reduced_dice = dice.cuda()
+            if dist.is_initialized():
+                dist.all_reduce(reduced_dice)
+                reduced_dice /= dist.get_world_size()
+        dice_class = dice_metric.aggregate().cpu().numpy() * 100.0
+        mDICE = np.mean(dice_class)
+        
+    dice_metric.reset()
+    return mDICE, dice_class
 
-            intersection, union, target = \
-                intersectionAndUnion(pred.cpu().numpy(), mask.numpy(), cfg['nclass'], 255)
+    #         intersection, union, target = \
+    #             intersectionAndUnion(pred.cpu().numpy(), mask.numpy()[0], cfg['nclass'], 255)
 
-            reduced_intersection = torch.from_numpy(intersection).cuda()
-            reduced_union = torch.from_numpy(union).cuda()
-            reduced_target = torch.from_numpy(target).cuda()
+    #         reduced_intersection = torch.from_numpy(intersection).cuda()
+    #         reduced_union = torch.from_numpy(union).cuda()
+    #         reduced_target = torch.from_numpy(target).cuda()
 
-            dist.all_reduce(reduced_intersection)
-            dist.all_reduce(reduced_union)
-            dist.all_reduce(reduced_target)
+    #         dist.all_reduce(reduced_intersection)
+    #         dist.all_reduce(reduced_union)
+    #         dist.all_reduce(reduced_target)
 
-            intersection_meter.update(reduced_intersection.cpu().numpy())
-            union_meter.update(reduced_union.cpu().numpy())
+    #         intersection_meter.update(reduced_intersection.cpu().numpy())
+    #         union_meter.update(reduced_union.cpu().numpy())
 
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10) * 100.0
-    mIOU = np.mean(iou_class)
+    # iou_class = intersection_meter.sum / (union_meter.sum + 1e-10) * 100.0
+    # mIOU = np.mean(iou_class)
 
-    return mIOU, iou_class
+    # return mIOU, iou_class
 
 
 def main():
