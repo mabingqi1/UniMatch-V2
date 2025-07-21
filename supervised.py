@@ -18,7 +18,6 @@ from monai.metrics import DiceMetric
 
 from dataset.semi import SemiDataset
 from model.semseg.dpt import DPT
-from util.classes import CLASSES
 from util.ohem import ProbOhemCrossEntropy2d
 from util.utils import count_params, AverageMeter, intersectionAndUnion, init_log
 from util.dist_helper import setup_distributed
@@ -34,15 +33,18 @@ parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
 
 
-def evaluate(model, loader, mode, cfg, multiplier=None):
+def evaluate(model, loader, mode, cfg, rank, multiplier=None):
     model.eval()
     assert mode in ['original', 'center_crop', 'sliding_window']
     dice_metric = DiceMetric(include_background=False, reduction="mean_batch")
 
     with torch.no_grad():
-        for img, mask in tqdm(loader, total=len(loader)):
+        if rank == 0:
+            progress_bar = tqdm(total=len(loader))
+        for img, mask in loader:
             img = img.cuda()
             mask = mask.cuda()
+
             if mode == 'sliding_window':
                 grid = cfg['crop_size']
                 b, _, h, w = img.shape
@@ -78,10 +80,11 @@ def evaluate(model, loader, mode, cfg, multiplier=None):
             
                 if multiplier is not None:
                     pred = F.interpolate(pred, (ori_h, ori_w), mode='bilinear', align_corners=True)
+
             pred = pred.softmax(dim=1)
             pred = pred.argmax(dim=1)
-            pred = F.one_hot(pred.squeeze(1), num_classes=cfg['nclass']+1).permute(0, 3, 1, 2).float()  # [B, n_cls, H, W]
-            mask = F.one_hot(mask.squeeze(1), num_classes=cfg['nclass']+1).permute(0, 3, 1, 2).float()
+            pred = F.one_hot(pred, num_classes=cfg['nclass']).permute(0, 3, 1, 2).float()  # [B, n_cls, H, W]
+            mask = F.one_hot(mask.squeeze(1), num_classes=cfg['nclass']).permute(0, 3, 1, 2).float()
             
             dice = dice_metric(y_pred=pred, y=mask)
             dice = dice.mean(dim=0)
@@ -89,31 +92,17 @@ def evaluate(model, loader, mode, cfg, multiplier=None):
             if dist.is_initialized():
                 dist.all_reduce(reduced_dice)
                 reduced_dice /= dist.get_world_size()
+            
+            if rank == 0:
+                progress_bar.update(1)
+
         dice_class = dice_metric.aggregate().cpu().numpy() * 100.0
         mDICE = np.mean(dice_class)
         
     dice_metric.reset()
+    progress_bar.close() if rank == 0 else None
+
     return mDICE, dice_class
-
-    #         intersection, union, target = \
-    #             intersectionAndUnion(pred.cpu().numpy(), mask.numpy()[0], cfg['nclass'], 255)
-
-    #         reduced_intersection = torch.from_numpy(intersection).cuda()
-    #         reduced_union = torch.from_numpy(union).cuda()
-    #         reduced_target = torch.from_numpy(target).cuda()
-
-    #         dist.all_reduce(reduced_intersection)
-    #         dist.all_reduce(reduced_union)
-    #         dist.all_reduce(reduced_target)
-
-    #         intersection_meter.update(reduced_intersection.cpu().numpy())
-    #         union_meter.update(reduced_union.cpu().numpy())
-
-    # iou_class = intersection_meter.sum / (union_meter.sum + 1e-10) * 100.0
-    # mIOU = np.mean(iou_class)
-
-    # return mIOU, iou_class
-
 
 def main():
     args = parser.parse_args()
@@ -254,15 +243,15 @@ def main():
         eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
         mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=14)
         
-        if rank == 0:
-            for (cls_idx, iou) in enumerate(iou_class):
-                logger.info('***** Evaluation ***** >>>> Class [{:} {:}] '
-                            'IoU: {:.2f}'.format(cls_idx, CLASSES[cfg['dataset']][cls_idx], iou))
-            logger.info('***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n'.format(eval_mode, mIoU))
+        # if rank == 0:
+        #     for (cls_idx, iou) in enumerate(iou_class):
+        #         logger.info('***** Evaluation ***** >>>> Class [{:} {:}] '
+        #                     'IoU: {:.2f}'.format(cls_idx, CLASSES[cfg['dataset']][cls_idx], iou))
+        #     logger.info('***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n'.format(eval_mode, mIoU))
             
-            writer.add_scalar('eval/mIoU', mIoU, epoch)
-            for i, iou in enumerate(iou_class):
-                writer.add_scalar('eval/%s_IoU' % (CLASSES[cfg['dataset']][i]), iou, epoch)
+        #     writer.add_scalar('eval/mIoU', mIoU, epoch)
+        #     for i, iou in enumerate(iou_class):
+        #         writer.add_scalar('eval/%s_IoU' % (CLASSES[cfg['dataset']][i]), iou, epoch)
         
         is_best = mIoU > previous_best
         previous_best = max(mIoU, previous_best)

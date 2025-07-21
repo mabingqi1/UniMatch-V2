@@ -1,12 +1,12 @@
-unlabel_num: 7800 # 1:10
+unlabel_num: 162795 # 1:5
 
-nclass: 11
+nclass: 12
 crop_size: 512
 patch_size: 16
 
 # arguments for training
-epochs: 20
-batch_size: 12 # per GPU x 4 GPUs
+epochs: 60
+batch_size: 20 # per GPU
 lr: 0.000005
 lr_multi: 40.0
 criterion:
