@@ -137,17 +137,18 @@ class SemiYHDataset(Dataset):
                 data = json.load(f)
                 self.ids = [item['img_path'] for item in data.get('data_list', [])]
                 self.labels = [item['seg_map_path'] for item in data.get('data_list', [])]
-                
-                # self.slice_indices = []
-                # for idx, img_id in enumerate(self.ids):
-                #     img = self.load_image(img_id)
-                #     num_slices = img.shape[-1] if img.ndim == 4 else 1
-                #     self.slice_indices.extend([(idx, slice_idx) for slice_idx in range(num_slices)])
 
         self.weak_transforms = Compose([
             RandResize(ratio_range=(0.5, 1.5)),
             RandCrop(size=self.size),
             RandHFlip(prob=0.5),
+        ])
+        self.strong_transforms = Compose([
+            RandColorJitter(prob=0.8, brightness=0.5, contrast=0.5, saturation=0.5, hue=0.25),
+            RandBlur(prob=0.5),    
+        ])
+        self.val_transforms = Compose([
+            Resized(keys=['img', 'mask'], spatial_size=(self.size, self.size), mode=['bilinear', 'nearest']),
             ZscoreNormWithOptionClip(clip=True, 
                                     clip_percentile=False, 
                                     clip_min_value=-1024, 
@@ -155,21 +156,7 @@ class SemiYHDataset(Dataset):
                                     clip_min_percentile=0.01,
                                     clip_max_percentile=0.99),
         ])
-        self.strong_transforms = Compose([
-            RandResize(ratio_range=(0.5, 1.5)),
-            RandCrop(size=self.size),
-            RandHFlip(prob=0.5),
-            RandColorJitter(prob=0.8, brightness=0.5, contrast=0.5, saturation=0.5, hue=0.25),
-            RandBlur(prob=0.5),
-            ZscoreNormWithOptionClip(clip=True, 
-                                    clip_percentile=False, 
-                                    clip_min_value=-1024, 
-                                    clip_max_value=2048,
-                                    clip_min_percentile=0.01,
-                                    clip_max_percentile=0.99),        
-        ])
-        self.val_transforms = Compose([
-            Resized(keys=['img', 'mask'], spatial_size=(self.size, self.size), mode=['bilinear', 'nearest']),
+        self.norm_transforms =  Compose([
             ZscoreNormWithOptionClip(clip=True, 
                                     clip_percentile=False, 
                                     clip_min_value=-1024, 
@@ -182,13 +169,15 @@ class SemiYHDataset(Dataset):
         return len(self.ids)
 
     def __getitem__(self, item):
-        if self.mode == 'val':
+        if self.mode == 'val' or self.mode == 'test':
             img = self.load_image(self.ids[item])
             mask = self.load_image(self.labels[item])
             mask = remap_mask(mask, LABEL_PROJ_DICT).squeeze(-1)
 
             data = {'img': img[0], 'mask': mask[0]}
             data = self.val_transforms(data)
+            if self.mode == 'test':
+                return data['img'].permute(2, 0, 1), data['mask'].permute(2, 0, 1).long(), self.ids[item]
 
             return data['img'].permute(2, 0, 1), data['mask'].permute(2, 0, 1).long()
         
@@ -201,6 +190,7 @@ class SemiYHDataset(Dataset):
 
             data = {'img': img, 'mask': mask.squeeze(-1)}
             data_w = self.weak_transforms(data)
+            data_w = self.norm_transforms(data_w)
 
             # import SimpleITK as sitk
             # im = sitk.GetImageFromArray(data_w['img'].numpy()[0])
@@ -217,11 +207,14 @@ class SemiYHDataset(Dataset):
             
             data = {'img': img, 'mask': ignore_mask}
             data_w = self.weak_transforms(data)
+            data_w = self.norm_transforms(data_w)
             data_s1 = deepcopy(data)
             data_s1 = self.strong_transforms(data_s1)
+            data_s1 = self.norm_transforms(data_s1)
             cutmix_box1 = obtain_cutmix_box(data_s1['img'].shape[-1], p=0.5)
             data_s2 = deepcopy(data)
             data_s2 = self.strong_transforms(data_s2)
+            data_s2 = self.norm_transforms(data_s2)
             cutmix_box2 = obtain_cutmix_box(data_s2['img'].shape[-1], p=0.5)
 
             # import cv2

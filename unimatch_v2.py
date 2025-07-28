@@ -19,7 +19,7 @@ from dataset.semi import SemiDataset, SemiYHDataset, LABEL_PROJ_DICT
 from model.semseg.dpt import DPT
 from supervised import evaluate
 from util.ohem import ProbOhemCrossEntropy2d
-from util.utils import count_params, init_log, AverageMeter
+from util.utils import count_params, init_log, AverageMeter, calculate_dice
 from util.dist_helper import setup_distributed
 
 
@@ -31,7 +31,7 @@ parser.add_argument('--val_json', type=str, required=True)
 parser.add_argument('--save-path', type=str, required=True)
 parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
-parser.add_argument('--infer', default=None, help='Test mode, no training will be performed')
+parser.add_argument('--infer', type=str, default='infer', help='Test mode, no training will be performed')
 
 
 def main():
@@ -43,7 +43,7 @@ def main():
 
     rank, world_size = setup_distributed(port=args.port)
 
-    if args.infer is not None:
+    if args.infer == 'infer':
     # 推理模式
         logger.info('Running in inference mode')
 
@@ -65,33 +65,45 @@ def main():
         model.eval()
 
         testset = SemiYHDataset(
-            args.val_json, mode='val'
+            args.val_json, mode='test'
         )
+        # testset = Subset(testset, random.sample(range(len(testset)), 50))
         # testsampler = torch.utils.data.distributed.DistributedSampler(testset)
         testloader = DataLoader(
             testset, batch_size=1, pin_memory=False, num_workers=0, drop_last=False, 
             # sampler=testsampler
         )
-        os.makedirs(os.path.join(args.save_path, 'outputsss'), exist_ok=True)
+        os.makedirs(os.path.join(args.save_path, 'output'), exist_ok=True)
+        os.makedirs(os.path.join(args.save_path, 'label'), exist_ok=True)
         # 推理并输出logits
         all_logits = []
+        dice = []
         with torch.no_grad():
-            for i, (img, mask) in enumerate(testloader):
+            for i, (img, mask, idx) in enumerate(testloader):
                 img = img.cuda()
                 logits = model(img)
                 all_logits.append(logits.cpu())
                 pred = torch.argmax(logits, dim=1).cpu().numpy().astype(np.uint8)  # [B, H, W]
                 pred = pred[0]  # [H, W]
+                mask = mask[0, 0]
+
+                cls_dice = calculate_dice(mask, pred, cfg['nclass'])
+                print(f'Image {i+1} DICE: {cls_dice}')
+                dice.append(cls_dice)
+            dice = np.array(dice)
+            for cls_idx in range(dice.shape[-1]):
+                clsDICE = np.nanmean(dice[:, cls_idx])
+                print(f'Class {cls_idx} DICE: {clsDICE}')
 
                 # 保存预测结果
-                sitk_img = sitk.GetImageFromArray(pred)
-                output_path = os.path.join(args.save_path, 'outputsss', f'pred_{i:04d}.nii.gz')
-                sitk.WriteImage(sitk_img, output_path)
-                # sitk.WriteImage(sitk.GetImageFromArray(mask[0].astype(np.uint8)), output_path.replace('pred', 'mask'))
+                # sitk_pred = sitk.GetImageFromArray(pred)
+                # sitk_mask = sitk.GetImageFromArray(mask)
+                # output_path = os.path.join(args.save_path, 'output', f'pred_{i:04d}.nii.gz')
+                # label_path = os.path.join(args.save_path, 'label', f'label_{i:04d}.nii.gz')
+                # sitk.WriteImage(sitk_pred, output_path)
+                # sitk.WriteImage(sitk_mask, label_path)
                 # raise
-                print('successfully saved prediction to {}'.format(output_path))
-
-        logger.info('INFER Finished!')
+                # print('successfully saved prediction to {}'.format(output_path))
     
         return
 
@@ -177,7 +189,7 @@ def main():
     valset = SemiYHDataset(
         args.val_json, mode='val'
     )
-    # valset = Subset(valset, random.sample(range(len(valset)), 10))
+    # valset = Subset(valset, random.sample(range(len(valset)), 200))
     if rank == 0:
         print(f"DATASET | Train labeled set size: {len(trainset_l)}\n"
               f"DATASET | Train unlabeled set size: {len(trainset_u)}\n"
@@ -186,17 +198,20 @@ def main():
 
     trainsampler_l = torch.utils.data.distributed.DistributedSampler(trainset_l)
     trainloader_l = DataLoader(
-        trainset_l, batch_size=cfg['batch_size'], pin_memory=True, num_workers=8, drop_last=True, sampler=trainsampler_l
+        trainset_l, batch_size=cfg['batch_size'], pin_memory=True, num_workers=12, drop_last=True, sampler=trainsampler_l
     )
     
     trainsampler_u = torch.utils.data.distributed.DistributedSampler(trainset_u)
     trainloader_u = DataLoader(
-        trainset_u, batch_size=cfg['batch_size'], pin_memory=True, num_workers=8, drop_last=True, sampler=trainsampler_u
+        trainset_u, batch_size=cfg['batch_size'], pin_memory=True, num_workers=12, drop_last=True, sampler=trainsampler_u
     )
     
-    valsampler = torch.utils.data.distributed.DistributedSampler(valset)
+    # valsampler = torch.utils.data.distributed.DistributedSampler(valset)
+    # valloader = DataLoader(
+    #     valset, batch_size=1, pin_memory=True, num_workers=0, drop_last=False, sampler=valsampler
+    # )
     valloader = DataLoader(
-        valset, batch_size=1, pin_memory=True, num_workers=0, drop_last=False, sampler=valsampler
+        valset, batch_size=1, pin_memory=True, num_workers=0, drop_last=False
     )
 
     ### CRITERION ###
@@ -350,7 +365,6 @@ def main():
             best_epoch_ema = epoch
         
         if rank == 0:
-            print(f'Final Results: Best epoch {best_epoch} with mDICE {previous_best:.3f},Best EMA epoch {best_epoch_ema} with mDICE {previous_best_ema:.3f}\n')
             checkpoint = {
                 'model': model.state_dict(),
                 'model_ema': model_ema.state_dict(),
@@ -364,7 +378,8 @@ def main():
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
             if is_best:
                 torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
-
+    if rank == 0:
+        print(f'Final Results: Best epoch {best_epoch} with mDICE {previous_best:.3f},Best EMA epoch {best_epoch_ema} with mDICE {previous_best_ema:.3f}\n')
 
 if __name__ == '__main__':
     main()

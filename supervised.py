@@ -5,18 +5,19 @@ import os
 import pprint
 from tqdm import tqdm
 import torch
+import random
 import numpy as np
 from torch import nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 from monai.metrics import DiceMetric
 
-from dataset.semi import SemiDataset
+from dataset.semi import SemiDataset, SemiYHDataset, LABEL_PROJ_DICT
 from model.semseg.dpt import DPT
 from util.ohem import ProbOhemCrossEntropy2d
 from util.utils import count_params, AverageMeter, intersectionAndUnion, init_log
@@ -25,9 +26,8 @@ from util.dist_helper import setup_distributed
 
 parser = argparse.ArgumentParser(description='Fully-Supervised Training in Semantic Segmentation')
 parser.add_argument('--config', type=str, required=True)
-parser.add_argument('--labeled-id-path', type=str, required=True)
-parser.add_argument('--unlabeled-id-path', type=str, default=None)
-parser.add_argument('--pretrained-path', type=str, default=None)
+parser.add_argument('--train_label_json', type=str, required=True)
+parser.add_argument('--val_json', type=str, default=None)
 parser.add_argument('--save-path', type=str, required=True)
 parser.add_argument('--local_rank', '--local-rank', default=0, type=int)
 parser.add_argument('--port', default=None, type=int)
@@ -36,8 +36,9 @@ parser.add_argument('--port', default=None, type=int)
 def evaluate(model, loader, mode, cfg, rank, multiplier=None):
     model.eval()
     assert mode in ['original', 'center_crop', 'sliding_window']
-    dice_metric = DiceMetric(include_background=False, reduction="mean_batch")
+    dice_metric = DiceMetric(include_background=False, reduction="none")
 
+    dices = []
     with torch.no_grad():
         if rank == 0:
             progress_bar = tqdm(total=len(loader))
@@ -87,16 +88,13 @@ def evaluate(model, loader, mode, cfg, rank, multiplier=None):
             mask = F.one_hot(mask.squeeze(1), num_classes=cfg['nclass']).permute(0, 3, 1, 2).float()
             
             dice = dice_metric(y_pred=pred, y=mask)
-            dice = dice.mean(dim=0)
-            reduced_dice = dice.cuda()
-            if dist.is_initialized():
-                dist.all_reduce(reduced_dice)
-                reduced_dice /= dist.get_world_size()
+            dices.append(dice[0].cpu().numpy())
             
             if rank == 0:
                 progress_bar.update(1)
 
-        dice_class = dice_metric.aggregate().cpu().numpy() * 100.0
+        dices = np.array(dices)
+        dice_class = np.nanmean(dices, axis=0)
         mDICE = np.mean(dice_class)
         
     dice_metric.reset()
@@ -135,8 +133,26 @@ def main():
     }
     model = DPT(**{**model_configs[cfg['backbone'].split('_')[-1]], 'nclass': cfg['nclass']})
     
-    state_dict = torch.load(f'./pretrained/{cfg["backbone"]}.pth')
-    model.backbone.load_state_dict(state_dict)
+    state_dict = torch.load(cfg['pretrain_weight'], map_location='cpu')
+    s_or_t = next(iter(state_dict))
+    keys_to_pop = []
+    keys_to_rename = []
+    for key in list(state_dict[s_or_t].keys()):
+        if "dino_head" in key:
+            keys_to_pop.append(key)
+        if "ibot_head" in key:
+            keys_to_pop.append(key)
+        if "backbone." in key:
+            keys_to_rename.append((key, key.replace("backbone.", "").replace("blocks.0.", "blocks.")))
+
+    for key in keys_to_pop:
+        state_dict[s_or_t].pop(key)
+    for old_key, new_key in keys_to_rename:
+        state_dict[s_or_t][new_key] = state_dict[s_or_t][old_key]
+        state_dict[s_or_t].pop(old_key)
+
+    fix_state_dict = state_dict[s_or_t]
+    model.backbone.load_state_dict(fix_state_dict, strict=True)
     
     if cfg['lock_backbone']:
         model.lock_backbone()
@@ -166,19 +182,23 @@ def main():
     else:
         raise NotImplementedError('%s criterion is not implemented' % cfg['criterion']['name'])
     
-    n_upsampled = {
-        'pascal': 3000, 
-        'cityscapes': 3000, 
-        'ade20k': 6000, 
-        'coco': 30000
-    }
-    trainset = SemiDataset(
-        cfg['dataset'], cfg['data_root'], 'train_l', cfg['crop_size'], args.labeled_id_path, nsample=n_upsampled[cfg['dataset']]
+    # trainset = SemiDataset(
+    #     cfg['dataset'], cfg['data_root'], 'train_l', cfg['crop_size'], args.labeled_id_path, nsample=cfg['unlabel_num']
+    # )
+    # valset = SemiDataset(
+    #     cfg['dataset'], cfg['data_root'], 'val'
+    # )
+    ### DATASET ###
+    trainset = SemiYHDataset(
+        args.train_label_json, mode='train_l', size=cfg['crop_size']
     )
-    valset = SemiDataset(
-        cfg['dataset'], cfg['data_root'], 'val'
+    valset = SemiYHDataset(
+        args.val_json, mode='val'
     )
-    
+    if rank == 0:
+        print(f"DATASET | Train labeled set size: {len(trainset)}\n"
+              f"DATASET | Val set size: {len(valset)}\n"
+              )
     trainsampler = torch.utils.data.distributed.DistributedSampler(trainset)
     trainloader = DataLoader(
         trainset, batch_size=cfg['batch_size'], pin_memory=True, num_workers=4, drop_last=True, sampler=trainsampler
@@ -237,24 +257,24 @@ def main():
                 writer.add_scalar('train/loss_all', loss.item(), iters)
                 writer.add_scalar('train/loss_x', loss.item(), iters)
             
-            if (i % (len(trainloader) // 8) == 0) and (rank == 0):
+            if (i % 10) and (rank == 0):
                 logger.info('Iters: {:}, Total loss: {:.3f}'.format(i, total_loss.avg))
         
-        eval_mode = 'sliding_window' if cfg['dataset'] == 'cityscapes' else 'original'
-        mIoU, iou_class = evaluate(model, valloader, eval_mode, cfg, multiplier=14)
+        eval_mode = cfg['eval_mode']
+        mDICE, dice_class = evaluate(model, valloader, eval_mode, cfg, rank, multiplier=cfg['patch_size'])
         
-        # if rank == 0:
-        #     for (cls_idx, iou) in enumerate(iou_class):
-        #         logger.info('***** Evaluation ***** >>>> Class [{:} {:}] '
-        #                     'IoU: {:.2f}'.format(cls_idx, CLASSES[cfg['dataset']][cls_idx], iou))
-        #     logger.info('***** Evaluation {} ***** >>>> MeanIoU: {:.2f}\n'.format(eval_mode, mIoU))
+        if rank == 0:
+            for (cls_idx, dice) in enumerate(dice_class):
+                logger.info('***** Evaluation ***** >>>> Class [{:} {:}] '
+                            'DICE: {:.2f}'.format(cls_idx+1, list(LABEL_PROJ_DICT.keys())[cls_idx], dice))
+            logger.info('***** Evaluation {} ***** >>>> MeanDICE: {:.2f}\n'.format(eval_mode, mDICE))
             
         #     writer.add_scalar('eval/mIoU', mIoU, epoch)
         #     for i, iou in enumerate(iou_class):
         #         writer.add_scalar('eval/%s_IoU' % (CLASSES[cfg['dataset']][i]), iou, epoch)
         
-        is_best = mIoU > previous_best
-        previous_best = max(mIoU, previous_best)
+        is_best = mDICE > previous_best
+        previous_best = max(mDICE, previous_best)
         if rank == 0:
             checkpoint = {
                 'model': model.state_dict(),

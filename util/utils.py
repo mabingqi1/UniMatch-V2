@@ -78,3 +78,26 @@ def init_log(name, level=logging.INFO):
     logger.addHandler(ch)
     return logger
 
+def calculate_dice(y_true, y_pred, num_classes=3):
+    dice_scores = []
+    
+    for cls in range(1, num_classes):
+        # Convert to binary for current class
+        true_cls = (y_true == cls).astype(np.float32)
+        pred_cls = (y_pred == cls).astype(np.float32)
+        
+        # Calculate intersection and union
+        intersection = np.sum(true_cls * pred_cls)
+        union = np.sum(true_cls) + np.sum(pred_cls)
+        
+        # Calculate Dice score for current class
+        if union == 0:
+            dice = np.nan
+        else:
+            dice = (2.0 * intersection) / (union + 1e-8)
+            
+        dice_scores.append(dice)
+    
+    # Calculate average Dice score
+    # avg_dice = np.mean(dice_scores)
+    return dice_scores
