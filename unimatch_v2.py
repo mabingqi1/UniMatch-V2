@@ -67,10 +67,10 @@ def main():
         testset = SemiYHDataset(
             args.val_json, mode='test'
         )
-        # testset = Subset(testset, random.sample(range(len(testset)), 50))
+        # testset = Subset(testset, range(200))
         # testsampler = torch.utils.data.distributed.DistributedSampler(testset)
         testloader = DataLoader(
-            testset, batch_size=1, pin_memory=False, num_workers=0, drop_last=False, 
+            testset, batch_size=1, pin_memory=False, num_workers=0, drop_last=False, shuffle=False
             # sampler=testsampler
         )
         os.makedirs(os.path.join(args.save_path, 'output'), exist_ok=True)
@@ -92,7 +92,7 @@ def main():
                 dice.append(cls_dice)
             dice = np.array(dice)
             for cls_idx in range(dice.shape[-1]):
-                clsDICE = np.nanmean(dice[:, cls_idx])
+                clsDICE = np.nanmean(dice[:, cls_idx]) * 100.0
                 print(f'Class {cls_idx} DICE: {clsDICE}')
 
                 # 保存预测结果
@@ -189,7 +189,7 @@ def main():
     valset = SemiYHDataset(
         args.val_json, mode='val'
     )
-    # valset = Subset(valset, random.sample(range(len(valset)), 200))
+    # valset = Subset(valset, range(200))
     if rank == 0:
         print(f"DATASET | Train labeled set size: {len(trainset_l)}\n"
               f"DATASET | Train unlabeled set size: {len(trainset_u)}\n"
@@ -211,7 +211,7 @@ def main():
     #     valset, batch_size=1, pin_memory=True, num_workers=0, drop_last=False, sampler=valsampler
     # )
     valloader = DataLoader(
-        valset, batch_size=1, pin_memory=True, num_workers=0, drop_last=False
+        valset, batch_size=1, pin_memory=True, num_workers=0, drop_last=False, shuffle=False
     )
 
     ### CRITERION ###
@@ -247,7 +247,10 @@ def main():
     for epoch in range(epoch + 1, cfg['epochs']):
         if rank == 0:
             logger.info('TRAIN | Epoch {:} | Previous Best: {:.2f} @ Epoch-{:} | '
-                        'EMA Best: {:.2f} @ Epoch-{:}'.format(epoch, previous_best, best_epoch, previous_best_ema, best_epoch_ema))
+                        'EMA Best: {:.2f} @ Epoch-{:}'.format(epoch, previous_best * 100.0, best_epoch, 
+                                                              previous_best_ema * 100.0, 
+                                                              best_epoch_ema
+                                                              ))
         
         total_loss  = AverageMeter()
         total_loss_x = AverageMeter()
@@ -334,26 +337,30 @@ def main():
 
             if (i % 10 == 0) and (rank == 0):
                 logger.info('TRAIN | Epoch {} | Iters: {:} | LR: {:.7f} | Total loss: {:.4f} | Loss x: {:.4f} | Loss s: {:.4f}, Mask ratio: '
-                            '{:.3f}'.format(epoch, i, optimizer.param_groups[0]['lr'], total_loss.avg, total_loss_x.avg, 
+                            '{:.4f}'.format(epoch, i, optimizer.param_groups[0]['lr'], total_loss.avg, total_loss_x.avg, 
                                             total_loss_s.avg, total_mask_ratio.avg))
         
         eval_mode = cfg['eval_mode']
         logger.info('Evaluation MAIN model...') if rank == 0 else None
-        mDICE, dice_class = evaluate(model, valloader, eval_mode, cfg, rank, multiplier=cfg['patch_size'])
+        mDICE, dice_class = evaluate(model, valloader, eval_mode, cfg, rank, multiplier=512)
         logger.info('Evaluation EMA model...') if rank == 0 else None
-        mDICE_ema, dice_class_ema = evaluate(model_ema, valloader, eval_mode, cfg, rank, multiplier=cfg['patch_size'])
-        
+        mDICE_ema, dice_class_ema = evaluate(model_ema, valloader, eval_mode, cfg, rank, multiplier=512)
         if rank == 0:
-            for cls_idx, dice in enumerate(dice_class):
-                print('RESULTS | Class [{:} {:}] DICE: {:.3f}, '
-                            'EMA: {:.3f}'.format(cls_idx+1, list(LABEL_PROJ_DICT.keys())[cls_idx], dice, dice_class_ema[cls_idx]))
-            print(' Evaluation {} Total Results >>>> mDICE: {:.3f}, EMA mDICE: {:.3f}\n'.format(eval_mode, mDICE, mDICE_ema))
+            for cls_id, (dice_cls, dice_cls_ema) in enumerate(zip(dice_class, dice_class_ema)):
+                print('RESULTS | Class [{:} {:}] DICE: {:.2f}, EMA: {:.2f}'.format(cls_id+1, 
+                                                                                   list(LABEL_PROJ_DICT.keys())[cls_id],
+                                                                                    dice_cls * 100.0, 
+                                                                                    dice_cls_ema * 100.0
+                                                                                    ))
+            print('Evaluation {} Total Results >>>> mDICE: {:.2f}, EMA mDICE: {:.2f}'.format(eval_mode, 
+                                                                                                mDICE * 100.0, 
+                                                                                                mDICE_ema * 100.0))
             
-            writer.add_scalar('eval/mDICE', mDICE, epoch)
-            writer.add_scalar('eval/mDICE_ema', mDICE_ema, epoch)
-            for i, dice in enumerate(dice_class):
-                writer.add_scalar('eval/%s_DICE' % (list(LABEL_PROJ_DICT.keys())[i]), dice, epoch)
-                writer.add_scalar('eval/%s_DICE_ema' % (list(LABEL_PROJ_DICT.keys())[i]), dice_class_ema[i], epoch)
+            # writer.add_scalar('eval/mDICE', mDICE, epoch)
+            # writer.add_scalar('eval/mDICE_ema', mDICE_ema, epoch)
+            # for i, dice in enumerate(dice_class):
+            #     writer.add_scalar('eval/%s_DICE' % (list(LABEL_PROJ_DICT.keys())[i]), dice, epoch)
+            #     writer.add_scalar('eval/%s_DICE_ema' % (list(LABEL_PROJ_DICT.keys())[i]), dice_class_ema[i], epoch)
 
         is_best = mDICE >= previous_best
         
@@ -378,6 +385,7 @@ def main():
             torch.save(checkpoint, os.path.join(args.save_path, 'latest.pth'))
             if is_best:
                 torch.save(checkpoint, os.path.join(args.save_path, 'best.pth'))
+                print('Best Checkpoint Epoch {} saved\n'.format(best_epoch))
     if rank == 0:
         print(f'Final Results: Best epoch {best_epoch} with mDICE {previous_best:.3f},Best EMA epoch {best_epoch_ema} with mDICE {previous_best_ema:.3f}\n')
 

@@ -20,7 +20,7 @@ from monai.metrics import DiceMetric
 from dataset.semi import SemiDataset, SemiYHDataset, LABEL_PROJ_DICT
 from model.semseg.dpt import DPT
 from util.ohem import ProbOhemCrossEntropy2d
-from util.utils import count_params, AverageMeter, intersectionAndUnion, init_log
+from util.utils import count_params, AverageMeter, intersectionAndUnion, init_log, calculate_dice
 from util.dist_helper import setup_distributed
 
 
@@ -36,12 +36,12 @@ parser.add_argument('--port', default=None, type=int)
 def evaluate(model, loader, mode, cfg, rank, multiplier=None):
     model.eval()
     assert mode in ['original', 'center_crop', 'sliding_window']
-    dice_metric = DiceMetric(include_background=False, reduction="none")
+    # dice_metric = DiceMetric(include_background=False, reduction="none")
 
     dices = []
+    dice_cls = []
     with torch.no_grad():
-        if rank == 0:
-            progress_bar = tqdm(total=len(loader))
+        progress_bar = tqdm(total=len(loader)) if rank == 0 else None
         for img, mask in loader:
             img = img.cuda()
             mask = mask.cuda()
@@ -84,23 +84,23 @@ def evaluate(model, loader, mode, cfg, rank, multiplier=None):
 
             pred = pred.softmax(dim=1)
             pred = pred.argmax(dim=1)
-            pred = F.one_hot(pred, num_classes=cfg['nclass']).permute(0, 3, 1, 2).float()  # [B, n_cls, H, W]
-            mask = F.one_hot(mask.squeeze(1), num_classes=cfg['nclass']).permute(0, 3, 1, 2).float()
-            
-            dice = dice_metric(y_pred=pred, y=mask)
-            dices.append(dice[0].cpu().numpy())
-            
-            if rank == 0:
-                progress_bar.update(1)
+
+            # pred = F.one_hot(pred, num_classes=cfg['nclass']).permute(0, 3, 1, 2).float()  # [B, n_cls, H, W]
+            # mask = F.one_hot(mask.squeeze(1), num_classes=cfg['nclass']).permute(0, 3, 1, 2).float()
+            dice = calculate_dice(mask, pred, cfg['nclass'])
+            dices.append(dice)
+            progress_bar.update(1) if rank == 0 else None
 
         dices = np.array(dices)
-        dice_class = np.nanmean(dices, axis=0)
-        mDICE = np.mean(dice_class)
+        for cls_idx in range(dices.shape[-1]):
+            dice_per_cls = np.nanmean(dices[:, cls_idx])
+            dice_cls.append(dice_per_cls)
+        mDICE = np.nanmean(dices)
         
-    dice_metric.reset()
+    # dice_metric.reset()
     progress_bar.close() if rank == 0 else None
 
-    return mDICE, dice_class
+    return mDICE, dice_cls
 
 def main():
     args = parser.parse_args()
@@ -240,7 +240,7 @@ def main():
 
             pred = model(img)
 
-            loss = criterion(pred, mask)
+            loss = criterion(pred, mask.squeeze(1))
             
             optimizer.zero_grad()
             loss.backward()
@@ -258,7 +258,7 @@ def main():
                 writer.add_scalar('train/loss_x', loss.item(), iters)
             
             if (i % 10) and (rank == 0):
-                logger.info('Iters: {:}, Total loss: {:.3f}'.format(i, total_loss.avg))
+                logger.info('Iters: {:}, LR: {:.7f}, Total loss: {:.3f}'.format(i, lr, total_loss.avg))
         
         eval_mode = cfg['eval_mode']
         mDICE, dice_class = evaluate(model, valloader, eval_mode, cfg, rank, multiplier=cfg['patch_size'])
@@ -266,8 +266,8 @@ def main():
         if rank == 0:
             for (cls_idx, dice) in enumerate(dice_class):
                 logger.info('***** Evaluation ***** >>>> Class [{:} {:}] '
-                            'DICE: {:.2f}'.format(cls_idx+1, list(LABEL_PROJ_DICT.keys())[cls_idx], dice))
-            logger.info('***** Evaluation {} ***** >>>> MeanDICE: {:.2f}\n'.format(eval_mode, mDICE))
+                            'DICE: {:.2f}'.format(cls_idx+1, list(LABEL_PROJ_DICT.keys())[cls_idx], dice * 100.0))
+            logger.info('***** Evaluation {} ***** >>>> MeanDICE: {:.2f}\n'.format(eval_mode, mDICE * 100.0))
             
         #     writer.add_scalar('eval/mIoU', mIoU, epoch)
         #     for i, iou in enumerate(iou_class):
